@@ -18,7 +18,7 @@ The engineering rules below are the same in both modes; only who answers questio
 - **Supervised** (default): a human is in the session. Follow the skill as written.
 - **Unattended**: nobody will answer, so never stop to wait. Use it ONLY when the invoking prompt says `Mode: unattended` or the environment has `CLIENT_SKILL_MODE=unattended`; never switch to it on your own.
 
-In unattended mode the invoking automation supplies: the command spec as `./HLD.md` (with the server PR in its `tracks:` field), the test command, and live servers with no Docker — a standalone Redis (`$REDIS_STANDALONE_HOST`:`$REDIS_STANDALONE_PORT`, started with `--databases 2000 --enable-debug-command yes --notify-keyspace-events AKE`) and a 6-node OSS cluster on one host (`$REDIS_CLUSTER_HOST`, ports from `$REDIS_CLUSTER_START_PORT`, `$REDIS_CLUSTER_NODES` nodes), no password, no TLS. `$REDIS_URL`, `$REDIS_CLUSTER_URLS` and `$REDIS_VERSION` describe the same servers; `redis-cli` is installed. Wherever a step has an **Unattended:** note, follow it:
+In unattended mode the invoking automation supplies: the command spec as `./HLD.md` (with the server PR in its `tracks:` field), the test command, and, with no Docker, a password-protected standalone Redis (`$REDIS_URL`, which carries the credentials) and a 6-node OSS cluster (`$REDIS_CLUSTER_URLS`, password `$REDIS_CLUSTER_PASSWORD`), plus `$REDIS_VERSION`; `redis-cli` is installed. Use them only to confirm the spec with `redis-cli`. This suite's `RedisTestConfig.json` has no password setting for the primary or the cluster, so the live integration tests can't reach these servers: unattended runs rely on the unit-test layers. Wherever a step has an **Unattended:** note, follow it:
 
 | Step | Supervised | Unattended |
 |---|---|---|
@@ -27,13 +27,13 @@ In unattended mode the invoking automation supplies: the command spec as `./HLD.
 | Step 8 `[Experimental]` gating | judge it | gate when the HLD/server PR marks the feature preview or it ships only in an RC/preview; record why |
 | Step 9 atomic composition | judge it | decide, and record the decision (mapped or not, and why) in the report |
 | An open design question | ask the user | take the HLD's choice, else the closest existing convention; list it as an open question |
-| Live integration tests | optional, docker topology | **required**, against the supplied servers — see *Optional: live integration test* below |
+| Live integration tests | optional, docker topology | not run: the supplied servers need a password `RedisTestConfig.json` can't carry; report them as not run (see below) |
 
 Unattended runs also follow these rules:
 
 - **Change files.** A run that ends without changes has failed; stop without editing only when implementing is impossible, and say exactly why.
 - **Don't commit, push or open a PR**, and don't edit `.github/`, release or version files. `PublicAPI.Unshipped.txt` edits are part of the change, not release files.
-- **Finish with a plain-text report**: what was implemented; design decisions (including step 8/9 and back-compat choices); unit and integration test results with counts and test names; steps skipped and why; open questions for maintainers.
+- **Finish with a plain-text report**: what was implemented; design decisions (including step 8/9 and back-compat choices); unit test results with counts and test names, and any live tests written but not run; steps skipped and why; open questions for maintainers.
 
 ## Source the command's spec first
 
@@ -169,22 +169,7 @@ Pick the `RedisFeatures.vX_Y_Z` constant matching the version that introduced th
 
 The in-process managed server (`toys/StackExchange.Redis.Server`) may also need a handler if integration tests run against it.
 
-**Unattended:** this layer is **required**, not optional, and runs against the supplied servers instead of docker.
-
-1. Point the suite at them. `RedisTestConfig.json` is an embedded resource, so overwrite it with the env values substituted (Newtonsoft; unset fields keep the `TestConfig.cs` defaults):
-   ```json
-   {
-     "PrimaryServer": "<REDIS_STANDALONE_HOST>",
-     "PrimaryPort": <REDIS_STANDALONE_PORT>,
-     "ClusterServer": "<REDIS_CLUSTER_HOST>",
-     "ClusterStartPort": <REDIS_CLUSTER_START_PORT>,
-     "ClusterServerCount": <REDIS_CLUSTER_NODES>
-   }
-   ```
-   The automation resets this file before committing; don't restore it yourself or count it as part of the change. A file that fails to parse is silently replaced by the defaults, so check the run below really reached the servers.
-2. Write the live tests: a class deriving `TestBase`, `[RunPerProtocol]` so RESP2 and RESP3 both run, `Create(require: RedisFeatures.vX)` as above. If the command takes keys, also run them on the cluster: a subclass overriding `protected override string GetConfiguration() => GetClusterConfiguration();` (see `HotKeysClusterTests` in `HotKeysTests.cs`). The cluster has only database 0, and multi-key commands need hash-tagged keys (`{tag}a`, `{tag}b`) so they share a slot.
-3. Run them with the given test command and `--filter "FullyQualifiedName~MyCommand"`, without `--no-build` (the rebuild is what embeds the new config). A test that skips with *Nothing is listening on ...* or *Unable to connect* means the config didn't take: fix it and rerun. A skip from `require:` on an older `$REDIS_VERSION` is a legitimate result; report it as such.
-4. Report the passed/failed/skipped counts and the test names, for the primary and the cluster. Sentinel, TLS, failover and replica tests have no server here; list any that apply as not run.
+**Unattended:** don't run this layer and don't edit `RedisTestConfig.json`. The supplied servers are password-protected, and the suite's test config has no password setting for the primary or the cluster, so the tests would only skip. Correctness rests on the ResultProcessor and RoundTrip unit tests. If a live test is still worth having for maintainers (e.g. a server-behaviour edge case), write it as the supervised guidance above describes, `require:`-gated, and list it in the report as *written, not run here*.
 
 ## Before finishing
 
@@ -192,4 +177,4 @@ The in-process managed server (`toys/StackExchange.Redis.Server`) may also need 
 - `dotnet test tests/StackExchange.Redis.Tests/StackExchange.Redis.Tests.csproj -f net10.0 --filter "FullyQualifiedName~MyCommand"` — runs your new unit tests without any server.
 - `dotnet test tests/StackExchange.Redis.Build.Tests/StackExchange.Redis.Build.Tests.csproj` — if you touched `TransactionAnalyzer`. Also needs no server, and takes seconds.
 - Double-check no shipped signature changed (back-compat).
-- **Unattended:** run all of the above (use the test command the automation gives for the unit tests), plus the live tests from step 3 of the unattended live-test notes, and put every result in the report.
+- **Unattended:** run all of the above, using the test command the automation gives for the unit tests, and put every result in the report. Live integration tests are not run (see above).
