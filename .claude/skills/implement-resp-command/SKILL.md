@@ -1,6 +1,8 @@
 ---
 name: implement-resp-command
-description: Add a new Redis/RESP command (or overload) to StackExchange.Redis end-to-end — enum, interfaces, RedisDatabase implementation, ResultProcessor, public-API tracking, the ResultProcessor + RoundTrip unit tests, and TransactionAnalyzer coverage where the command replaces a transaction. Use when asked to "add/implement/support a Redis command", wire up a new RESP command, expose a server feature on IDatabase/IDatabaseAsync, or add a result processor.
+description: Add a new Redis/RESP command (or overload) to StackExchange.Redis end-to-end — enum, interfaces, RedisDatabase implementation, ResultProcessor, public-API tracking, the ResultProcessor + RoundTrip unit tests, and TransactionAnalyzer coverage where the command replaces a transaction. Use when asked to "add/implement/support a Redis command", wire up a new RESP command, expose a server feature on IDatabase/IDatabaseAsync, or add a result processor. Runs supervised (a human answers questions) by default, or unattended for automation that supplies the spec and a live Redis.
+metadata:
+  modes: supervised, unattended
 ---
 
 # Implement a new RESP command
@@ -8,6 +10,30 @@ description: Add a new Redis/RESP command (or overload) to StackExchange.Redis e
 This walks through adding a command to **StackExchange.Redis** (the `src/StackExchange.Redis` client). Read `AGENTS.md` first — especially **Public API tracking → Backwards compatibility is paramount** and **Architecture**. Do every step; the build and the API analyzer will fail loudly if you skip the wiring, but the *tests* are what prove the command actually works.
 
 Use an existing, similarly-shaped command as your template (e.g. `StringGet`/`GET` for a simple key command, `StreamAutoClaim`/`XAUTOCLAIM` for a structured aggregate reply). Grep `RedisDatabase.cs` for one and mirror it.
+
+## Modes
+
+The engineering rules below are the same in both modes; only who answers questions differs.
+
+- **Supervised** (default): a human is in the session. Follow the skill as written.
+- **Unattended**: nobody will answer, so never stop to wait. Use it ONLY when the invoking prompt says `Mode: unattended` or the environment has `CLIENT_SKILL_MODE=unattended`; never switch to it on your own.
+
+In unattended mode the invoking automation supplies: the command spec as `./HLD.md` (with the server PR in its `tracks:` field), the test command, and live servers with no Docker — a standalone Redis (`$REDIS_STANDALONE_HOST`:`$REDIS_STANDALONE_PORT`, started with `--databases 2000 --enable-debug-command yes --notify-keyspace-events AKE`) and a 6-node OSS cluster on one host (`$REDIS_CLUSTER_HOST`, ports from `$REDIS_CLUSTER_START_PORT`, `$REDIS_CLUSTER_NODES` nodes), no password, no TLS. `$REDIS_URL`, `$REDIS_CLUSTER_URLS` and `$REDIS_VERSION` describe the same servers; `redis-cli` is installed. Wherever a step has an **Unattended:** note, follow it:
+
+| Step | Supervised | Unattended |
+|---|---|---|
+| Spec for a new/unreleased command | ask the user | read `./HLD.md` fully; fill gaps from the server PR, then `redis-cli -u "$REDIS_URL" COMMAND DOCS <CMD>` |
+| Module command: first-class binding? | confirm with the user | only if the HLD targets this library; otherwise stop and report that it belongs in a companion library |
+| Step 8 `[Experimental]` gating | judge it | gate when the HLD/server PR marks the feature preview or it ships only in an RC/preview; record why |
+| Step 9 atomic composition | judge it | decide, and record the decision (mapped or not, and why) in the report |
+| An open design question | ask the user | take the HLD's choice, else the closest existing convention; list it as an open question |
+| Live integration tests | optional, docker topology | **required**, against the supplied servers — see *Optional: live integration test* below |
+
+Unattended runs also follow these rules:
+
+- **Change files.** A run that ends without changes has failed; stop without editing only when implementing is impossible, and say exactly why.
+- **Don't commit, push or open a PR**, and don't edit `.github/`, release or version files. `PublicAPI.Unshipped.txt` edits are part of the change, not release files.
+- **Finish with a plain-text report**: what was implemented; design decisions (including step 8/9 and back-compat choices); unit and integration test results with counts and test names; steps skipped and why; open questions for maintainers.
 
 ## Source the command's spec first
 
@@ -17,8 +43,9 @@ Before writing anything, get the command's exact argument order and reply shape 
   - **Server source, JSON spec** — e.g. `https://github.com/redis/redis/blob/unstable/src/commands/xdelex.json`. This is the most precise: argument tokens/order/optionality, `arity`, key specs, and the **`write`/`readonly` command flags** (which directly tell you the `IsPrimaryOnly` classification) plus, often, a `reply_schema`.
   - **HTML docs** — e.g. `https://redis.io/docs/latest/commands/xdelex/`. More readable, with reply examples.
   - (For non-Redis targets the equivalents are the Valkey/Garnet/etc. source and docs — but the wire command is usually identical.)
-- **Module commands** (RediSearch `FT.*`, RedisJSON `JSON.*`, RedisTimeSeries `TS.*`, RedisBloom, …) live in each module's own repo, usually as a single aggregated `commands.json` (e.g. RediSearch: `https://github.com/RediSearch/RediSearch/blob/master/commands.json`) rather than core Redis's one-file-per-command layout. Use it the same way for argument/reply shape. **But module commands are generally handled by separate companion libraries (e.g. [NRedisStack](https://github.com/redis/NRedisStack)), not core StackExchange.Redis** — so usually you won't add them here at all; ad-hoc use goes through the generic `Execute`/`ExecuteAsync(string command, …)` → `RedisResult` API. If you *do* wire one as first-class, note the wire token is dotted (`FT.SEARCH`) and a C# enum member name can't contain `.`; the token for a member whose name isn't a valid identifier is supplied via the `[AsciiHash("FT.SEARCH")]` override — see `eng/StackExchange.Redis.Build/AsciiHash.md`. Confirm that a first-class typed binding is actually intended before following the enum steps below.
+- **Module commands** (RediSearch `FT.*`, RedisJSON `JSON.*`, RedisTimeSeries `TS.*`, RedisBloom, …) live in each module's own repo, usually as a single aggregated `commands.json` (e.g. RediSearch: `https://github.com/RediSearch/RediSearch/blob/master/commands.json`) rather than core Redis's one-file-per-command layout. Use it the same way for argument/reply shape. **But module commands are generally handled by separate companion libraries (e.g. [NRedisStack](https://github.com/redis/NRedisStack)), not core StackExchange.Redis** — so usually you won't add them here at all; ad-hoc use goes through the generic `Execute`/`ExecuteAsync(string command, …)` → `RedisResult` API. If you *do* wire one as first-class, note the wire token is dotted (`FT.SEARCH`) and a C# enum member name can't contain `.`; the token for a member whose name isn't a valid identifier is supplied via the `[AsciiHash("FT.SEARCH")]` override — see `eng/StackExchange.Redis.Build/AsciiHash.md`. Confirm that a first-class typed binding is actually intended before following the enum steps below. **Unattended:** treat it as intended only if the HLD says this library gets it.
 - **New / unreleased commands** may not be in either yet. In that case **ask the user for the spec** — the exact argument order and a concrete sample request/reply (RESP bytes if possible) — rather than guessing; the round-trip and ResultProcessor tests are only as correct as that sample.
+  **Unattended:** don't ask; `./HLD.md` is the spec. Take the server PR from its `tracks:` field, and confirm the argument order and both reply shapes against the live server (`redis-cli -u "$REDIS_URL" ...`, and `redis-cli -3` for RESP3) before writing the tests.
 - **RESP2 vs RESP3:** the reply (and occasionally argument handling) can differ subtly between protocols — e.g. a map/`%` vs a flat `*` array, a double/`,` vs a bulk-string number, or added attributes. The JSON `reply_schema` sometimes distinguishes them. Capture **both** forms and handle them in the `ResultProcessor` (and cover both in the unit tests).
 
 ## Steps
@@ -54,9 +81,9 @@ Before writing anything, get the command's exact argument order and reply shape 
 
 7. **Write the two unit-test layers** (below). These run with **no external server**, so they're the fast, reliable proof of correctness — write them even if you also add live integration tests.
 
-8. **Gate pre-release server features** behind `[Experimental(Experiments.Server_8_x)]` when appropriate (see `src/RESPite/Shared/Experiments.cs`).
+8. **Gate pre-release server features** behind `[Experimental(Experiments.Server_8_x)]` when appropriate (see `src/RESPite/Shared/Experiments.cs`). **Unattended:** gate when the HLD or server PR marks the feature preview, and say why in the report.
 
-9. **Ask whether the command is an *atomic composition*** — does it do in one round-trip what callers currently write a `MULTI`/`WATCH` transaction (or several queued commands) to achieve? A surprising number of new commands are exactly that: `GETDEL`, `GETEX`, `HGETDEL`, `SMOVE`, `SET ... NX/GET/IFEQ`, `SMISMEMBER`, every `M*`/variadic form. If yes, teach `TransactionAnalyzer` about it, or the people who would benefit most never find out it exists — see the section below.
+9. **Ask whether the command is an *atomic composition*** — does it do in one round-trip what callers currently write a `MULTI`/`WATCH` transaction (or several queued commands) to achieve? A surprising number of new commands are exactly that: `GETDEL`, `GETEX`, `HGETDEL`, `SMOVE`, `SET ... NX/GET/IFEQ`, `SMISMEMBER`, every `M*`/variadic form. If yes, teach `TransactionAnalyzer` about it, or the people who would benefit most never find out it exists — see the section below. **Unattended:** answer this yourself and put the answer, with the reasoning, in the report.
 
 ## If the command replaces a transaction
 
@@ -142,9 +169,27 @@ Pick the `RedisFeatures.vX_Y_Z` constant matching the version that introduced th
 
 The in-process managed server (`toys/StackExchange.Redis.Server`) may also need a handler if integration tests run against it.
 
+**Unattended:** this layer is **required**, not optional, and runs against the supplied servers instead of docker.
+
+1. Point the suite at them. `RedisTestConfig.json` is an embedded resource, so overwrite it with the env values substituted (Newtonsoft; unset fields keep the `TestConfig.cs` defaults):
+   ```json
+   {
+     "PrimaryServer": "<REDIS_STANDALONE_HOST>",
+     "PrimaryPort": <REDIS_STANDALONE_PORT>,
+     "ClusterServer": "<REDIS_CLUSTER_HOST>",
+     "ClusterStartPort": <REDIS_CLUSTER_START_PORT>,
+     "ClusterServerCount": <REDIS_CLUSTER_NODES>
+   }
+   ```
+   The automation resets this file before committing; don't restore it yourself or count it as part of the change. A file that fails to parse is silently replaced by the defaults, so check the run below really reached the servers.
+2. Write the live tests: a class deriving `TestBase`, `[RunPerProtocol]` so RESP2 and RESP3 both run, `Create(require: RedisFeatures.vX)` as above. If the command takes keys, also run them on the cluster: a subclass overriding `protected override string GetConfiguration() => GetClusterConfiguration();` (see `HotKeysClusterTests` in `HotKeysTests.cs`). The cluster has only database 0, and multi-key commands need hash-tagged keys (`{tag}a`, `{tag}b`) so they share a slot.
+3. Run them with the given test command and `--filter "FullyQualifiedName~MyCommand"`, without `--no-build` (the rebuild is what embeds the new config). A test that skips with *Nothing is listening on ...* or *Unable to connect* means the config didn't take: fix it and rerun. A skip from `require:` on an older `$REDIS_VERSION` is a legitimate result; report it as such.
+4. Report the passed/failed/skipped counts and the test names, for the primary and the cluster. Sentinel, TLS, failover and replica tests have no server here; list any that apply as not run.
+
 ## Before finishing
 
 - `dotnet build Build.csproj -c Release /p:CI=true` — analyzers + `TreatWarningsAsErrors` must pass (this catches a missing `PublicAPI.Unshipped.txt` entry).
 - `dotnet test tests/StackExchange.Redis.Tests/StackExchange.Redis.Tests.csproj -f net10.0 --filter "FullyQualifiedName~MyCommand"` — runs your new unit tests without any server.
 - `dotnet test tests/StackExchange.Redis.Build.Tests/StackExchange.Redis.Build.Tests.csproj` — if you touched `TransactionAnalyzer`. Also needs no server, and takes seconds.
 - Double-check no shipped signature changed (back-compat).
+- **Unattended:** run all of the above (use the test command the automation gives for the unit tests), plus the live tests from step 3 of the unattended live-test notes, and put every result in the report.
